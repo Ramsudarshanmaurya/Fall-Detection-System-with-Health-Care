@@ -1,144 +1,125 @@
 #include <Wire.h>
-#include <Adafruit_Sensor.h>
-#include <Adafruit_MPU6050.h>
 #include <LiquidCrystal_I2C.h>
-#include <SoftwareSerial.h>
+#include <MPU6050.h>
 #include <MAX30100_PulseOximeter.h>
-#include <TinyGPS++.h>
+#include <SoftwareSerial.h>
 
-// Objects
-Adafruit_MPU6050 mpu;
-LiquidCrystal_I2C lcd(0x27, 20, 4);
-SoftwareSerial gsm(9, 10);     // GSM
-SoftwareSerial gps(3, 4);      // GPS
-TinyGPSPlus gpsData;
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+MPU6050 mpu;
 PulseOximeter pox;
 
-// Pins
-const int pulseSensorPin = A0;
-const int redLedPin = 5;
-const int buzzerPin = 6;
+SoftwareSerial gsm(7, 8); // RX, TX
 
-bool alertSent = false;
+float heartRate;
+float spo2;
 
-void setup() {
+unsigned long lastReport = 0;
+
+const char phoneNumber[] = "+91XXXXXXXXXX";
+
+void sendSMS(String message)
+{
+  gsm.println("AT+CMGF=1");
+  delay(1000);
+
+  gsm.print("AT+CMGS=\"");
+  gsm.print(phoneNumber);
+  gsm.println("\"");
+
+  delay(1000);
+
+  gsm.print(message);
+
+  delay(500);
+
+  gsm.write(26);
+
+  delay(5000);
+}
+
+void setup()
+{
   Serial.begin(9600);
-  
   gsm.begin(9600);
-  gps.begin(9600);
-  
-  lcd.begin(20, 4);
+
+  Wire.begin();
+
+  lcd.init();
   lcd.backlight();
 
-  if (!mpu.begin()) {
-    lcd.print("MPU Failed!");
+  lcd.setCursor(0, 0);
+  lcd.print("Health Monitor");
+
+  mpu.initialize();
+
+  if (!pox.begin())
+  {
+    lcd.clear();
+    lcd.print("MAX30100 Error");
     while (1);
   }
 
-  if (!pox.begin()) {
-    lcd.print("MAX30100 Failed!");
-    while (1);
-  }
-
-  pinMode(redLedPin, OUTPUT);
-  pinMode(buzzerPin, OUTPUT);
-
-  lcd.print("System Ready");
   delay(2000);
   lcd.clear();
 }
 
-void loop() {
+void loop()
+{
+  pox.update();
 
-  pox.update();   // VERY IMPORTANT
+  heartRate = pox.getHeartRate();
+  spo2 = pox.getSpO2();
 
-  // ===== MPU6050 =====
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
+  int16_t ax, ay, az;
+  mpu.getAcceleration(&ax, &ay, &az);
+
+  float accel =sqrt((long)ax * ax +(long)ay * ay +(long)az * az) / 16384.0;
 
   lcd.setCursor(0, 0);
-  lcd.print("Acc X:");
-  lcd.print(a.acceleration.x);
-
-  // Fall detection (strong threshold)
-  if (abs(a.acceleration.x) > 15 ||
-      abs(a.acceleration.y) > 15 ||
-      abs(a.acceleration.z) > 15) {
-    triggerAlert("Fall Detected!");
-  }
-
-  // ===== Pulse Sensor =====
-  int pulseValue = analogRead(pulseSensorPin);
+  lcd.print("HR:");
+  lcd.print((int)heartRate);
+  lcd.print(" BPM ");
 
   lcd.setCursor(0, 1);
-  lcd.print("Pulse:");
-  lcd.print(pulseValue);
+  lcd.print("S:");
+  lcd.print((int)spo2);
+  lcd.print("%   ");
 
-  if (pulseValue > 800) {
-    triggerAlert("High Pulse!");
+  if (millis() - lastReport > 1000)
+  {
+    Serial.print("Heart Rate: ");
+    Serial.print(heartRate);
+
+    Serial.print(" BPM  SpO2: ");
+    Serial.print(spo2);
+    Serial.println("%");
+
+    lastReport = millis();
   }
 
-  // ===== SpO2 =====
-  float spo2 = pox.getSpO2();
+  // Fall Detection
+  if (accel > 3.0)
+  {
+    lcd.clear();
+    lcd.print("FALL DETECTED");
 
-  lcd.setCursor(0, 2);
-  lcd.print("SpO2:");
-  lcd.print(spo2);
+    sendSMS("Emergency Alert! Fall Detected. Please check immediately.");
 
-  if (spo2 < 90 && spo2 > 0) {
-    triggerAlert("Low SpO2!");
+    delay(10000);
+    lcd.clear();
   }
 
-  delay(1000);
-}
-
-void triggerAlert(String msg) {
-
-  if (alertSent) return;   // prevent spam
-
-  digitalWrite(redLedPin, HIGH);
-  digitalWrite(buzzerPin, HIGH);
-
-  float lat = 26.765844;
-  float lon = 83.364944;
-
-  // ===== Read GPS =====
-  gps.listen();
-  unsigned long start = millis();
-  while (millis() - start < 3000) {
-    while (gps.available()) {
-      gpsData.encode(gps.read());
-    }
+  // Abnormal Heart Rate
+  if (heartRate > 120 || heartRate < 50)
+  {
+    sendSMS("Warning! Abnormal Heart Rate Detected.");
+    delay(10000);
   }
 
-  if (gpsData.location.isValid()) {
-    lat = gpsData.location.lat();
-    lon = gpsData.location.lng();
+  // Low SpO2
+  if (spo2 > 0 && spo2 < 90)
+  {
+    sendSMS("Warning! Low SpO2 Detected.");
+    delay(10000);
   }
-
-  String location = "https://maps.google.com/?q=" + String(lat, 6) + "," + String(lon, 6);
-
-  // ===== Send SMS =====
-  gsm.listen();
-  sendSMS(msg + "\nLocation: " + location);
-
-  digitalWrite(redLedPin, LOW);
-  digitalWrite(buzzerPin, LOW);
-
-  alertSent = true;  // send only once
-}
-
-void sendSMS(String msg) {
-
-  gsm.println("AT+CMGF=1");
-  delay(1000);
-
-  gsm.println("AT+CMGS=\"+918948253069\"");
-  delay(1000);
-
-  gsm.print(msg);
-  delay(500);
-
-  gsm.write(26);
-  delay(3000);
 }
